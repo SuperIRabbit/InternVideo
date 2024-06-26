@@ -55,7 +55,7 @@ model = dict(
         checkpoint_num=40,
         use_flash_attn=use_half_precision,
         use_fused_rmsnorm=use_half_precision,
-        use_fused_mlp=use_half_precision,
+        use_fused_mlp=False,
         # clip teacher
         clip_teacher=None,
         clip_input_resolution=224,
