@@ -14,15 +14,21 @@ from .flash_attention_class import FlashAttention
 
 logger = logging.getLogger(__name__)
 
+# Attempt to load flash attention custom ops. If unable to
+# load, fall back to naive implementation.
 try:
     from flash_attn.ops.fused_dense import FusedMLP
+    use_flash_attn = True
 except:
     logger.warn(f'FusedMLP of flash_attn is not installed!!!')
+    use_flash_attn = False
 
 try:
     from flash_attn.ops.rms_norm import DropoutAddRMSNorm
+    use_flash_attn = True
 except:
     logger.warn(f'DropoutAddRMSNorm of flash_attn is not installed!!!')
+    use_flash_attn = False
 
 
 class CrossAttention(nn.Module):
@@ -694,9 +700,9 @@ def pretrain_internvideo2_1b_patch14_224(config):
         drop_path_rate=0.25,
         init_values=0.00001,
         qk_normalization=True,
-        use_flash_attn=config.vision_encoder.get('use_flash_attn', True),
-        use_fused_rmsnorm=config.vision_encoder.get('use_fused_rmsnorm', True),
-        use_fused_mlp=config.vision_encoder.get('use_fused_mlp', True),
+        use_flash_attn=(config.vision_encoder.get('use_flash_attn', True) and use_flash_attn),
+        use_fused_rmsnorm=(config.vision_encoder.get('use_fused_rmsnorm', True) and use_flash_attn),
+        use_fused_mlp=(config.vision_encoder.get('use_fused_mlp', True) and use_flash_attn),
         fused_mlp_heuristic=1,
         layerscale_no_force_fp32=False,
         num_frames=config.vision_encoder.num_frames,
