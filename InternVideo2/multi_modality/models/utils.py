@@ -296,3 +296,4 @@ def tie_encoder_decoder_weights(
     tie_encoder_to_decoder_recursively(
         decoder, encoder, base_model_prefix, uninitialized_encoder_weights, skip_key
     )
+
