@@ -1,4 +1,4 @@
-import ipdb;
+import ipdb
 import math
 import logging
 import torch
@@ -20,8 +20,10 @@ from .internvideo2 import (
     RMSNorm, 
     CrossAttention,
     AttentiveBlock,
+    PatchEmbed,
     Linear_Decoder, 
-    AttentionPoolingBlock
+    AttentionPoolingBlock, 
+    PretrainInternVideo2
 )
 
 logger = logging.getLogger(__name__)
@@ -42,36 +44,7 @@ except:
     logger.warn(f'DropoutAddRMSNorm of flash_attn is not installed!!!')
     use_flash_attn = False
 
-class RLTPatchEmbed(nn.Module):
-    """ 3D Image to Patch Embedding
-    """
-
-    def __init__(
-            self, img_size=224, patch_size=16, in_chans=3, embed_dim=768,
-            num_frames=8, tubelet_size=1, norm_layer=None
-        ):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.tubelet_size = tubelet_size
-        self.grid_size = (
-            num_frames // tubelet_size,
-            img_size[0] // patch_size[0],
-            img_size[1] // patch_size[1]
-        ) # (T, H, W)
-        self.num_patches = self.grid_size[0] * self.grid_size[1] * self.grid_size[2]
-        self.num_img_patches = self.grid_size[1] * self.grid_size[2]
-
-        self.proj = nn.Conv3d(
-            in_channels=in_chans, out_channels=embed_dim,
-            kernel_size=(tubelet_size, patch_size[0], patch_size[1]),
-            stride=(tubelet_size, patch_size[0], patch_size[1])
-        )
-        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
-
-    def batched_find_idxs_to_keep(self, x: torch.Tensor, 
+def batched_find_idxs_to_keep(x: torch.Tensor, 
                               threshold: int= 0.05, 
                               tubelet_size: int=1,
                               patch_size: int=14) -> torch.Tensor:
@@ -118,18 +91,166 @@ class RLTPatchEmbed(nn.Module):
         #ipdb.set_trace()
         return keep_idxs
 
-    @torch.no_grad()
-    def run_rlt(x, pos_embed):
-        return x, pos_embed
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0., use_flash_attn=False,
+                 causal=False, norm_layer=nn.LayerNorm, qk_normalization=False, use_fused_rmsnorm=False):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        self.use_flash_attn = use_flash_attn
+        if use_flash_attn:
+            self.causal = causal
+            self.inner_attn = FlashAttention(attention_dropout=attn_drop)
+
+        self.qk_normalization = qk_normalization
+        self.q_norm = norm_layer(dim) if qk_normalization else nn.Identity()
+        self.k_norm = norm_layer(dim) if qk_normalization else nn.Identity()
+        self.use_fused_rmsnorm = use_fused_rmsnorm
+
+    def _naive_attn(self, x):
+        B, N, C = x.shape
+        # print(x.shape, torch.cuda.memory_allocated(), torch.cuda.memory_allocated())
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+
+        if self.qk_normalization:
+            B_, H_, N_, D_ = q.shape
+            q = self.q_norm(q.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
+            k = self.k_norm(k.transpose(1, 2).flatten(-2, -1)).view(B_, N_, H_, D_).transpose(1, 2)
+
+        attn = ((q * self.scale) @ k.transpose(-2, -1))
+        # attn = attn - attn.max(-1)[0].unsqueeze(-1)  # in case of overflow for fp16
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        # print(torch.cuda.memory_allocated(), torch.cuda.memory_allocated())
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def _flash_attn(self, x, key_padding_mask=None, need_weights=False, cu_seqlens=None, max_s=None):
+
+        qkv = self.qkv(x)
+        #ipdb.set_trace()
+        qkv = rearrange(qkv, "b (three h d) -> b three h d", three=3, h=self.num_heads)
+
+        if self.qk_normalization:
+            # 3 x (B, H, D) -> (2050, 12, 1488)
+            q, k, v = qkv.unbind(1)
+            if self.use_fused_rmsnorm:
+                q = self.q_norm(q.flatten(-2, -1))[0].view(q.shape)
+                k = self.k_norm(k.flatten(-2, -1))[0].view(k.shape)
+            else:
+                q = self.q_norm(q.flatten(-2, -1)).view(q.shape)
+                k = self.k_norm(k.flatten(-2, -1)).view(k.shape)
+            qkv = torch.stack([q, k, v], dim=1)
+        #ipdb.set_trace()
+        if cu_seqlens is not None:
+            max_s = 1025
+        
+        context, _ = self.inner_attn(
+            qkv, key_padding_mask=key_padding_mask, need_weights=need_weights, causal=self.causal,
+            cu_seqlens=cu_seqlens, max_s=max_s,
+        )
+        #ipdb.set_trace()
+        outs = self.proj(rearrange(context, "b h d -> b (h d)"))
+        outs = self.proj_drop(outs)
+        return outs
+
+    def forward(self, x, cu_seqlens=None):
+        if self.use_flash_attn:
+            return self._flash_attn(x, cu_seqlens=cu_seqlens)
+        else: 
+            return self._naive_attn(x)
+
+class Block(nn.Module):
+
+    def __init__(
+            self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., init_values=None,
+            drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, use_flash_attn=False, use_fused_mlp=False,
+            fused_mlp_heuristic=1, with_cp=False, qk_normalization=False, layerscale_no_force_fp32=False,
+            use_fused_rmsnorm=False):
+        super().__init__()
+
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop,
+                              use_flash_attn=use_flash_attn, causal=False, norm_layer=norm_layer,
+                              qk_normalization=qk_normalization,
+                              use_fused_rmsnorm=use_fused_rmsnorm)
+        self.ls1 = LayerScale(dim, init_values=init_values,
+                              force_fp32=(not layerscale_no_force_fp32)) if init_values else nn.Identity()
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        if use_fused_mlp:
+            self.mlp = FusedMLP(in_features=dim, hidden_features=mlp_hidden_dim, heuristic=fused_mlp_heuristic)
+        else:
+            self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.ls2 = LayerScale(dim, init_values=init_values,
+                              force_fp32=(not layerscale_no_force_fp32)) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+        self.with_cp = with_cp
+        self.use_fused_rmsnorm = use_fused_rmsnorm
+
+    def forward(self, x, residual=None, cu_seqlens=None):
+
+        def _inner_forward(x, residual=None):
+            if self.use_fused_rmsnorm:
+                x, residual = self.norm1(x, residual)
+                x = self.drop_path1(self.ls1(self.attn(x, cu_seqlens=cu_seqlens)))
+                x, residual = self.norm2(x, residual)
+                x = self.drop_path2(self.ls2(self.mlp(x)))
+                return x, residual
+            else:
+                assert residual is None
+                x = x + self.drop_path1(self.ls1(self.attn(self.norm1(x))))
+                x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+                return x
+
+        if self.with_cp:
+            # print(f"\033[31m use_checkpoint [0m")
+            return checkpoint.checkpoint(_inner_forward, x, residual, use_reentrant=False)
+        else:
+            return _inner_forward(x, residual=residual)
+
+
+class RLTPatchEmbed(PatchEmbed):
+    """
+    Modified patch embedding with slightly different shapes than the 
+    default implementation.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.proj(x)
+        x = x.flatten(start_dim=1)  # N x D x 1 x 1 x 1 => N x D
+        x = self.norm(x)
+
+        return x
+
+class RLTTokenizer(nn.Module):
+    def __init__(self, num_frames=4, tubelet_size=1, patch_size=(14, 14)):
+        super().__init__()
+        self.num_frames = num_frames
+        self.tubelet_size = tubelet_size
+        self.patch_size = patch_size
 
     def forward(self, x):
-        ##################################
-        #ipdb.set_trace()
         assert self.patch_size[0] == self.patch_size[1]
         # Rearrange into tiles for Conv3D
-        keep_mask = self.batched_find_idxs_to_keep(
+        keep_mask = batched_find_idxs_to_keep(
             x,
-            threshold=0.05,
+            threshold=0.15, 
             tubelet_size=self.tubelet_size,
             patch_size=self.patch_size[0])
         # Rearrange into tiles for Conv3D
@@ -142,21 +263,12 @@ class RLTPatchEmbed(nn.Module):
             p1=self.patch_size[0],
             p2=self.patch_size[1],
         )
-        #ipdb.set_trace()
+        #if keep_mask.sum() < 1024:
+        #ipdb.set_trace()    
 
-        ##################################
-        x = self.proj(x)
-        x = x.flatten(start_dim=1)  # N x D x 1 x 1 x 1 => N x D
-        x = self.norm(x)
-        # Add a dimension. We need to remove this later ot handle 
-        # variable seqlens
-        x = x.unsqueeze(0)
-        #B, T, L, C = x.shape  # T: temporal; L: spatial
-        #x = x.view([B,  C])
-        # Output is now (sum_{i=1^B} N_i),  C
         return x, keep_mask
 
-class RLTPretrainInternVideo2(nn.Module):
+class RLTPretrainInternVideo2(PretrainInternVideo2):
     def __init__(
             self,
             in_chans: int = 3,
@@ -177,7 +289,7 @@ class RLTPretrainInternVideo2(nn.Module):
             attn_pool_num_heads: int = 16,
             clip_embed_dim: int = 768,
             layerscale_no_force_fp32: bool = False,
-            num_frames: int = 8,
+            num_frames: int = 4,
             tubelet_size: int = 1,
             sep_pos_embed: bool = False,
             sep_image_video_pos_embed: bool = False,
@@ -247,7 +359,7 @@ class RLTPretrainInternVideo2(nn.Module):
                     with_cp_list[idx] = True
         logger.info(f"Droppath rate: {dpr}")
         logger.info(f"Checkpoint list: {with_cp_list}")
-
+        self.tokenizer = RLTTokenizer(num_frames=num_frames, tubelet_size=tubelet_size)
         self.blocks = nn.ModuleList([
             Block(embed_dim, num_heads, mlp_ratio, qkv_bias=qkv_bias,
                   norm_layer=norm_layer_for_blocks,
@@ -286,84 +398,18 @@ class RLTPretrainInternVideo2(nn.Module):
         self.apply(self._init_weights)
         self.fix_init_weight()
 
-    def init_pos_embed(self):
-        logger.info("Init pos_embed from sincos pos_embed")
-        if self.sep_pos_embed:
-            raise NotImplementedError
-        else:
-            # trunc_normal_(self.pos_embed, std=.02)
-            # trunc_normal_(self.clip_pos_embed, std=.02)
-            pos_embed = get_3d_sincos_pos_embed(
-                self.pos_embed.shape[-1],
-                self.patch_embed.grid_size[1], # height & weight
-                self.patch_embed.grid_size[0], # t_size
-                cls_token=True
-            )
-            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-            self.clip_pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-            if self.sep_image_video_pos_embed:
-                img_pos_embed = get_3d_sincos_pos_embed(
-                    self.pos_embed.shape[-1],
-                    self.patch_embed.grid_size[1], # height & weight
-                    1,
-                    cls_token=True
-                )
-                self.img_pos_embed.data.copy_(torch.from_numpy(img_pos_embed).float().unsqueeze(0))
-                self.clip_img_pos_embed.data.copy_(torch.from_numpy(img_pos_embed).float().unsqueeze(0))
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def fix_init_weight(self):
-        def rescale(param, layer_id):
-            param.div_(math.sqrt(2.0 * layer_id))
-
-        for layer_id, layer in enumerate(self.blocks):
-            rescale(layer.attn.proj.weight.data, layer_id + 1)
-            rescale(layer.mlp.fc2.weight.data, layer_id + 1)
-
-    @property
-    def dtype(self):
-        return self.patch_embed.proj.weight.dtype
-
-    def get_num_layers(self):
-        return len(self.blocks)
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        return {
-            'pos_embed',
-            'pos_embed_spatial',
-            'pos_embed_temporal',
-            'pos_embed_cls',
-            'img_pos_embed',
-            'cls_token',
-            'clip_pos_embed',
-            'clip_pos_embed_spatial',
-            'clip_pos_embed_temporal',
-            'clip_pos_embed_cls',
-            'clip_img_pos_embed'
-        }
-
     # @torch.cuda.amp.autocast(enabled=False)
     def forward(self, x, mask=None, use_image=False, x_vis_return_idx=-1, x_vis_only=False):
         keep_mask = None
-        x, keep_mask = self.patch_embed(x.type(self.dtype))
-        #ipdb.set_trace()
-        # print(f"x.shape: {x.shape} x.dtype: {x.dtype}, model.dtype: {self.dtype}")
-        B, C = x.shape[0], x.shape[-1]
+        B = x.shape[0]
+        x, keep_mask = self.tokenizer(x)
+        seqlens = keep_mask.sum(dim=1).to(torch.int32)
+        x = self.patch_embed(x.type(self.dtype))
+        x = x.reshape((B, x.shape[0] // B, *x.shape[1:]))
 
-        # append cls token
         cls_tokens = self.cls_token.expand(B, -1, -1)
         # TEMPORARY: REMOVE LATER
-        x = x[keep_mask].unsqueeze(0)
+        #x = x[keep_mask].unsqueeze(0)
         x = torch.cat((cls_tokens, x), dim=1)
 
         # add pos_embed
@@ -380,34 +426,36 @@ class RLTPretrainInternVideo2(nn.Module):
                     # print('cls_pos_embed.shape:', cls_pos_embed.shape)
 
                     img_pos_embed = self.pos_embed[:, 1:, :].view(1, self.num_frames, self.patch_embed.num_patches // self.num_frames, self.embed_dim).mean(dim=1)
-                    if keep_mask is not None:
-                        img_pos_embed = img_pos_embed[keep_mask]
+                    # if keep_mask is not None:
+                    #     img_pos_embed = img_pos_embed[keep_mask]
                     # print('img_pos_embed.shape:', img_pos_embed.shape)
                     
                     pos_embed = torch.cat([cls_pos_embed, img_pos_embed], dim=1)
                     # print('final img_pos_embed.shape:', pos_embed.shape)
             else:
                 pos_embed = self.pos_embed
-        #ipdb.set_trace()
         # Select the RLT tokens, but keep CLS token.
-        selected_embed = pos_embed[:, 1:][keep_mask].unsqueeze(0)
-        cls_pos_embed = pos_embed[:, 0:1, :]
-        pos_embed = torch.cat([cls_pos_embed, selected_embed], dim=1)
+        # selected_embed = pos_embed[:, 1:][keep_mask].unsqueeze(0)
+        # cls_pos_embed = pos_embed[:, 0:1, :]
+        # pos_embed = torch.cat([cls_pos_embed, selected_embed], dim=1)
         x = x + pos_embed
 
         # mask tokens, ~mask means visible
         if mask is not None:
             x = x[~mask].reshape(B, -1, C)
-        else:
-            x = x.reshape(B, -1, C)
+        #else:
+        #    x = x.reshape(B, -1, C)
 
+        # Flatten the first 2. 
+        x = x.flatten(end_dim=1)
+        
         residual = None
         x_clip = []
         for idx, blk in enumerate(self.blocks):
             if isinstance(x, tuple) and len(x) == 2:
                 x, residual = x
             # print(f"\033[31m这是{idx}, {x.shape}\033[0m")
-            x = blk(x, residual=residual)
+            x = blk(x, residual=residual, cu_seqlens=seqlens)
             # return intermediate features
             if idx in self.return_index:
                 if isinstance(x, tuple) and len(x) == 2:
@@ -426,12 +474,13 @@ class RLTPretrainInternVideo2(nn.Module):
                 x = x + residual
 
         x_vis = x
+        # Return the sequence lenghts also.
         if x_vis_only:
-            return x_vis
+            return x_vis, seqlens
 
         x_pool_vis = self.clip_projector(x_vis)
         x_align = self.final_clip_decoder(x_pool_vis)
-
+        ipdb.set_trace()
         # align CLIP
         x_clip = torch.stack(x_clip)
         K, B, _, C_CLIP = x_clip.shape

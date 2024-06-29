@@ -310,7 +310,7 @@ class Block(nn.Module):
 
         if self.with_cp:
             # print(f"\033[31m use_checkpoint [0m")
-            return checkpoint.checkpoint(_inner_forward, x, residual)
+            return checkpoint.checkpoint(_inner_forward, x, residual, use_reentrant=False)
         else:
             return _inner_forward(x, residual=residual)
 
