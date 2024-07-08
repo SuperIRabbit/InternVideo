@@ -15,8 +15,8 @@ max_txt_l = 40
 
 origin_num_frames = 4
 
-use_half_precision = False
-use_bf16 = False
+use_half_precision = True
+use_bf16 = True
 
 inputs = dict(
     image_res=224,

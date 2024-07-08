@@ -44,10 +44,13 @@ class FlashAttention(nn.Module):
             batch_size = qkv.shape[0]
             seqlen = qkv.shape[1]
             if key_padding_mask is None:
-                cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=qkv.device)
-                qkv = rearrange(qkv, 'b s ... -> (b s) ...', b=batch_size)
+                qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+
+                max_s = seqlen
+                cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
+                                          device=qkv.device)
                 output = flash_attn_varlen_qkvpacked_func(
-                    qkv, cu_seqlens, seqlen, self.dropout_p if self.training else 0.0,
+                    qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
                     softmax_scale=self.softmax_scale, causal=causal
                 )
                 output = rearrange(output, '(b s) ... -> b s ...', b=batch_size)
@@ -69,6 +72,5 @@ class FlashAttention(nn.Module):
                 qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
             )
-            #ipdb.set_trace()
-
+        
         return output, None
