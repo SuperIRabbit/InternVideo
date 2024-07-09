@@ -1,11 +1,15 @@
+import logging
 import torch
 import torch.nn as nn
-
 from einops import rearrange
 
-# from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
-# from flash_attn.bert_padding import unpad_input, pad_input
+logger = logging.getLogger(__name__)
 
+try: 
+    from flash_attn.flash_attn_interface import flash_attn_varlen_qkvpacked_func
+    from flash_attn.bert_padding import unpad_input, pad_input
+except:
+    logger.warn(f'Flash-Attn is not installed!!!')
 
 class FlashAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
@@ -41,6 +45,7 @@ class FlashAttention(nn.Module):
             seqlen = qkv.shape[1]
             if key_padding_mask is None:
                 qkv = rearrange(qkv, 'b s ... -> (b s) ...')
+
                 max_s = seqlen
                 cu_seqlens = torch.arange(0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32,
                                           device=qkv.device)
@@ -67,5 +72,5 @@ class FlashAttention(nn.Module):
                 qkv, cu_seqlens, max_s, self.dropout_p if self.training else 0.0,
                 softmax_scale=self.softmax_scale, causal=causal
             )
-
+        
         return output, None

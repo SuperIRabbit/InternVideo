@@ -14,15 +14,21 @@ from .flash_attention_class import FlashAttention
 
 logger = logging.getLogger(__name__)
 
+# Attempt to load flash attention custom ops. If unable to
+# load, fall back to naive implementation.
 try:
-    from flash_attn.modules.mlp import FusedMLP
+    from flash_attn.ops.fused_dense import FusedMLP
+    flash_installed = True
 except:
     logger.warn(f'FusedMLP of flash_attn is not installed!!!')
+    flash_installed = False
 
 try:
     from flash_attn.ops.rms_norm import DropoutAddRMSNorm
+    flash_installed = True
 except:
     logger.warn(f'DropoutAddRMSNorm of flash_attn is not installed!!!')
+    flash_installed = False
 
 
 class CrossAttention(nn.Module):
@@ -304,7 +310,7 @@ class Block(nn.Module):
 
         if self.with_cp:
             # print(f"\033[31m use_checkpoint [0m")
-            return checkpoint.checkpoint(_inner_forward, x, residual)
+            return checkpoint.checkpoint(_inner_forward, x, residual, use_reentrant=False)
         else:
             return _inner_forward(x, residual=residual)
 
@@ -694,9 +700,9 @@ def pretrain_internvideo2_1b_patch14_224(config):
         drop_path_rate=0.25,
         init_values=0.00001,
         qk_normalization=True,
-        use_flash_attn=config.vision_encoder.get('use_flash_attn', True),
-        use_fused_rmsnorm=config.vision_encoder.get('use_fused_rmsnorm', True),
-        use_fused_mlp=config.vision_encoder.get('use_fused_mlp', True),
+        use_flash_attn=(config.vision_encoder.get('use_flash_attn', True) and flash_installed),
+        use_fused_rmsnorm=(config.vision_encoder.get('use_fused_rmsnorm', True) and flash_installed),
+        use_fused_mlp=(config.vision_encoder.get('use_fused_mlp', True) and flash_installed),
         fused_mlp_heuristic=1,
         layerscale_no_force_fp32=False,
         num_frames=config.vision_encoder.num_frames,
@@ -732,9 +738,9 @@ def pretrain_internvideo2_6b_patch14_224(config):
         drop_path_rate=0.3,
         init_values=0.00001,
         qk_normalization=True,
-        use_flash_attn=config.vision_encoder.get('use_flash_attn', True),
-        use_fused_rmsnorm=config.vision_encoder.get('use_fused_rmsnorm', True),
-        use_fused_mlp=config.vision_encoder.get('use_fused_mlp', True),
+        use_flash_attn=(config.vision_encoder.get('use_flash_attn', True) and flash_installed),
+        use_fused_rmsnorm=(config.vision_encoder.get('use_fused_rmsnorm', True) and flash_installed),
+        use_fused_mlp=(config.vision_encoder.get('use_fused_mlp', True) and flash_installed),
         fused_mlp_heuristic=1,
         layerscale_no_force_fp32=False,
         num_frames=config.vision_encoder.num_frames,
